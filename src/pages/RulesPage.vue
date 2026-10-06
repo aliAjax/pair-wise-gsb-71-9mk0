@@ -20,7 +20,14 @@ const form = reactive({
 const { data: rules, isLoading } = useQuery({ queryKey: ['rules'], queryFn: getRules })
 const { data: projects } = useQuery({ queryKey: ['projects'], queryFn: getProjects })
 
-const refreshRules = async () => queryClient.invalidateQueries({ queryKey: ['rules'] })
+const refreshRules = async () => {
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: ['rules'] }),
+    queryClient.invalidateQueries({ queryKey: ['takeovers'] }),
+  ])
+}
+
+const staleHint = () => Message.warning('规则已变化，未确认接管单将失效重算；已批准基线保留当时快照')
 
 const createMutation = useMutation({
   mutationFn: createRule,
@@ -36,6 +43,7 @@ const createMutation = useMutation({
       maxDelta: 10,
       enabled: true,
     })
+    staleHint()
     await refreshRules()
   },
   onError: (error: Error) => Message.error(error.message),
@@ -43,7 +51,10 @@ const createMutation = useMutation({
 
 const toggleMutation = useMutation({
   mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => toggleRule(id, enabled),
-  onSuccess: refreshRules,
+  onSuccess: async () => {
+    staleHint()
+    await refreshRules()
+  },
   onError: (error: Error) => Message.error(error.message),
 })
 
@@ -51,6 +62,7 @@ const deleteMutation = useMutation({
   mutationFn: deleteRule,
   onSuccess: async () => {
     Message.success('规则已删除')
+    staleHint()
     await refreshRules()
   },
   onError: (error: Error) => Message.error(error.message),
@@ -87,7 +99,7 @@ const projectName = (id: string) =>
   </section>
 
   <a-alert type="info" style="margin-bottom: 16px">
-    规则不会自动批准整张截图；启用后仅在差异报告中折叠匹配区域，高风险区域仍需人工判定。
+    规则不会自动批准整张截图；启用后仅在差异报告中折叠匹配区域，高风险区域仍需人工判定。规则或阈值一变，未确认接管单立即失效重算，已批准基线保留批准当时的规则快照。
   </a-alert>
 
   <a-card class="table-panel" :bordered="false">

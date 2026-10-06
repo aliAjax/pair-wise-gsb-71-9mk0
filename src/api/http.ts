@@ -1,6 +1,15 @@
 import axios, { type AxiosAdapter, type InternalAxiosRequestConfig } from 'axios'
 import { readDb, writeDb } from '@/mocks/db'
+import {
+  computeScreenshotSummary,
+  confirmTakeover,
+  invalidateTakeoversForRule,
+  recoverBatch,
+  recomputeTakeover,
+  submitApprovalPackage,
+} from '@/utils/takeover'
 import type {
+  ApprovalPackagePayload,
   Baseline,
   DashboardData,
   IgnoreRule,
@@ -9,6 +18,9 @@ import type {
   ReviewPayload,
   RunFilters,
   ScreenshotRun,
+  TakeoverBatch,
+  TakeoverOrder,
+  TakeoverRecoveryResult,
 } from '@/types'
 
 export const api = axios.create({
@@ -93,37 +105,17 @@ const mockAdapter: AxiosAdapter = async (config) => {
     const payload = parseBody<ReviewPayload>(config)
     const run = db.runs.find((item) => item.id === reviewMatch[1])
     if (!run) throw new Error('运行记录不存在')
-    run.status = payload.decision
-    run.review = {
-      ...payload,
-      reviewedAt: new Date().toISOString(),
+    // 评审提交统一走续作接管：同页两窗口同时提交时，先到者启用、后到者留草稿并列冲突
+    const packagePayload: ApprovalPackagePayload = {
+      runId: run.id,
+      decision: payload.decision,
+      reviewer: payload.reviewer,
+      reason: payload.reason,
+      category: payload.category,
     }
-    if (payload.decision === 'approved') {
-      const baseline = db.baselines.find(
-        (item) =>
-          item.projectId === run.projectId &&
-          item.page === run.page &&
-          item.device === run.device &&
-          item.theme === run.theme &&
-          item.active,
-      )
-      if (baseline) baseline.active = false
-      db.baselines.unshift({
-        id: `base-${Date.now()}`,
-        projectId: run.projectId,
-        page: run.page,
-        device: run.device,
-        theme: run.theme,
-        version: run.currentVersion,
-        approvedBy: payload.reviewer,
-        reason: payload.reason,
-        approvedAt: new Date().toISOString(),
-        runId: run.id,
-        active: true,
-      })
-    }
-    writeDb(db)
-    return respond(config, run)
+    const result = submitApprovalPackage(db, packagePayload)
+    const updatedRun = db.runs.find((item) => item.id === run.id) as ScreenshotRun
+    return respond(config, { run: updatedRun, takeover: result.order })
   }
 
   if (method === 'post' && path === '/runs/merge') {
@@ -222,6 +214,8 @@ const mockAdapter: AxiosAdapter = async (config) => {
       createdAt: new Date().toISOString(),
     }
     db.rules.unshift(rule)
+    // 规则一变，未确认接管失效重算；已批准基线保留当时快照
+    invalidateTakeoversForRule(db, rule, '创建')
     writeDb(db)
     return respond(config, rule, 201)
   }
@@ -232,15 +226,89 @@ const mockAdapter: AxiosAdapter = async (config) => {
     const rule = db.rules.find((item) => item.id === ruleMatch[1])
     if (!rule) throw new Error('规则不存在')
     Object.assign(rule, payload)
+    invalidateTakeoversForRule(db, rule, '更新')
     writeDb(db)
     return respond(config, rule)
   }
   if (method === 'delete' && ruleMatch) {
     const index = db.rules.findIndex((item) => item.id === ruleMatch[1])
     if (index < 0) throw new Error('规则不存在')
-    db.rules.splice(index, 1)
+    const [removed] = db.rules.splice(index, 1)
+    invalidateTakeoversForRule(db, removed, '删除')
     writeDb(db)
     return respond(config, { success: true })
+  }
+
+  if (method === 'get' && path === '/takeovers') {
+    return respond<TakeoverOrder[]>(config, db.takeovers)
+  }
+
+  if (method === 'get' && path === '/takeovers/batches') {
+    return respond<TakeoverBatch[]>(config, db.batches)
+  }
+
+  const summaryMatch = path.match(/^\/runs\/([^/]+)\/screenshot-summary$/)
+  if (method === 'get' && summaryMatch) {
+    const targetRun = db.runs.find((item) => item.id === summaryMatch[1])
+    if (!targetRun) throw new Error('运行记录不存在')
+    return respond(
+      config,
+      computeScreenshotSummary(targetRun, db.rules),
+    )
+  }
+
+  if (method === 'post' && path === '/takeovers/packages') {
+    const body = parseBody<{ payload: ApprovalPackagePayload; simulateActivationWriteFailure?: boolean }>(
+      config,
+    )
+    const result = submitApprovalPackage(db, body.payload, {
+      simulateActivationWriteFailure: body.simulateActivationWriteFailure,
+    })
+    return respond(config, result, 201)
+  }
+
+  const takeoverActionMatch = path.match(/^\/takeovers\/([^/]+)\/(recompute|confirm|attach-summary)$/)
+  if (method === 'post' && takeoverActionMatch) {
+    const [, id, action] = takeoverActionMatch
+    let order: TakeoverOrder
+    if (action === 'recompute') {
+      order = recomputeTakeover(db, id)
+    } else if (action === 'confirm') {
+      order = confirmTakeover(db, id).order
+    } else {
+      const target = db.takeovers.find((item) => item.id === id)
+      if (!target) throw new Error('接管单不存在')
+      const targetRun = db.runs.find((item) => item.id === target.runId)
+      if (!targetRun) throw new Error('关联运行不存在，无法补核摘要')
+      // 旧包补传截图摘要：以当前运行与规则现算摘要并写入，随后判定一致/失效
+      const summary = computeScreenshotSummary(targetRun, db.rules)
+      target.screenshotSummary = summary
+      target.ruleFingerprint = summary.ruleFingerprint
+      target.staleReasons = target.staleReasons.filter(
+        (reason) => !reason.includes('缺少截图摘要'),
+      )
+      if (summary.digest !== computeScreenshotSummary(targetRun, db.rules).digest) {
+        target.status = 'stale'
+      } else {
+        // 补核一致：进入「已补核·待确认」，人工确认后才接管启用
+        target.status = 'verified'
+      }
+      writeDb(db)
+      order = target
+    }
+    return respond(config, order)
+  }
+
+  const batchRecoverMatch = path.match(/^\/takeovers\/batches\/([^/]+)\/recover$/)
+  if (method === 'post' && batchRecoverMatch) {
+    const recovery = recoverBatch(db, batchRecoverMatch[1])
+    const result: TakeoverRecoveryResult = {
+      batchId: recovery.batch.id,
+      recovered: recovery.activations.some((item) => item.applied),
+      activations: recovery.activations,
+      order: recovery.order,
+    }
+    return respond(config, result, 201)
   }
 
   throw new Error(`Mock API 未实现：${method.toUpperCase()} ${path}`)
@@ -255,14 +323,48 @@ export const getRuns = async (filters: RunFilters = {}): Promise<ScreenshotRun[]
   (await api.get<ScreenshotRun[]>('/runs', { params: filters })).data
 export const getRun = async (id: string): Promise<ScreenshotRun> =>
   (await api.get<ScreenshotRun>(`/runs/${id}`)).data
-export const reviewRun = async (id: string, payload: ReviewPayload): Promise<ScreenshotRun> =>
-  (await api.patch<ScreenshotRun>(`/runs/${id}/review`, payload)).data
+export const reviewRun = async (
+  id: string,
+  payload: ReviewPayload,
+): Promise<{ run: ScreenshotRun; takeover: TakeoverOrder }> =>
+  (await api.patch(`/runs/${id}/review`, payload)).data
 export const mergeRuns = async (ids: string[]): Promise<ScreenshotRun> =>
   (await api.post<ScreenshotRun>('/runs/merge', ids)).data
 export const importRuns = async (payload: ImportRunPayload): Promise<ScreenshotRun[]> =>
   (await api.post<ScreenshotRun[]>('/runs/import', payload)).data
 export const getBaselines = async (projectId?: string): Promise<Baseline[]> =>
   (await api.get<Baseline[]>('/baselines', { params: { projectId } })).data
+export const getTakeovers = async (): Promise<TakeoverOrder[]> =>
+  (await api.get<TakeoverOrder[]>('/takeovers')).data
+export const getTakeoverBatches = async (): Promise<TakeoverBatch[]> =>
+  (await api.get<TakeoverBatch[]>('/takeovers/batches')).data
+export const getScreenshotSummary = async (
+  runId: string,
+): Promise<import('@/types').ScreenshotSummary> =>
+  (await api.get(`/runs/${runId}/screenshot-summary`)).data
+export const submitPackage = async (
+  payload: ApprovalPackagePayload & { simulateActivationWriteFailure?: boolean },
+): Promise<{ order: TakeoverOrder; batch: TakeoverBatch }> => {
+  const { simulateActivationWriteFailure, ...approvalPayload } = payload
+  return (
+    await api.post('/takeovers/packages', {
+      payload: approvalPayload,
+      simulateActivationWriteFailure,
+    })
+  ).data
+}
+export const recomputeTakeoverOrder = async (id: string): Promise<TakeoverOrder> =>
+  (await api.post<TakeoverOrder>(`/takeovers/${id}/recompute`)).data
+export const attachTakeoverSummary = async (id: string): Promise<TakeoverOrder> =>
+  (await api.post<TakeoverOrder>(`/takeovers/${id}/attach-summary`)).data
+export const confirmTakeoverOrder = async (
+  id: string,
+): Promise<{ order: TakeoverOrder; batch: TakeoverBatch }> =>
+  (await api.post(`/takeovers/${id}/confirm`)).data
+export const recoverTakeoverBatch = async (
+  batchId: string,
+): Promise<TakeoverRecoveryResult> =>
+  (await api.post<TakeoverRecoveryResult>(`/takeovers/batches/${batchId}/recover`)).data
 export const getRules = async (): Promise<IgnoreRule[]> =>
   (await api.get<IgnoreRule[]>('/rules')).data
 export const createRule = async (

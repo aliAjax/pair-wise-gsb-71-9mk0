@@ -1,12 +1,22 @@
-import type { Baseline, DifferenceRegion, IgnoreRule, Project, ScreenshotRun } from '@/types'
+import type {
+  Baseline,
+  DifferenceRegion,
+  IgnoreRule,
+  Project,
+  ScreenshotRun,
+  TakeoverBatch,
+  TakeoverOrder,
+} from '@/types'
 
 const STORAGE_KEY = 'visual-regression-platform-v1'
 
-interface Database {
+export interface Database {
   projects: Project[]
   runs: ScreenshotRun[]
   baselines: Baseline[]
   rules: IgnoreRule[]
+  takeovers: TakeoverOrder[]
+  batches: TakeoverBatch[]
 }
 
 const projects: Project[] = [
@@ -261,7 +271,54 @@ const rules: IgnoreRule[] = [
   },
 ]
 
-const seed = (): Database => ({ projects, runs, baselines, rules })
+const legacyConclusions: import('@/types').RegionConclusion[] = [
+  { regionId: '1044-r1', kind: 'layout', severity: 'high', pixels: 1840, verdict: 'render-error', ignored: false },
+  { regionId: '1044-r2', kind: 'color', severity: 'medium', pixels: 720, verdict: 'design-change', ignored: false },
+  { regionId: '1044-r3', kind: 'environment', severity: 'low', pixels: 216, verdict: 'environment-noise', ignored: true, ruleId: 'rule-time' },
+]
+
+const seedTakeovers: TakeoverOrder[] = [
+  {
+    id: 'takeover-legacy-9181',
+    packageId: 'pkg-legacy-2026-09-27',
+    runId: 'run-1044',
+    projectId: 'p-console',
+    page: '资源详情',
+    device: 'Desktop 1440',
+    theme: 'light',
+    targetKey: 'p-console|资源详情|Desktop 1440|light',
+    baselineVersion: 'v5.9.1-baseline',
+    screenshotSummary: null,
+    regionConclusions: legacyConclusions,
+    decision: 'approved',
+    reviewer: '周航',
+    reason: '旧审批系统回传的审批包缺少截图摘要，需要人工补核后才能续作接管。',
+    status: 'pending-verification',
+    staleReasons: ['旧审批包缺少截图摘要，先待核，补传摘要后再启用'],
+    ruleFingerprint: 'legacy',
+    batchId: 'batch-legacy-9181',
+    receivedAt: '2026-09-28T14:05:00+08:00',
+  },
+]
+
+const seed = (): Database => ({
+  projects,
+  runs,
+  baselines,
+  rules,
+  takeovers: seedTakeovers.map((order) => ({ ...order })),
+  batches: [],
+})
+
+/** 补齐旧版本浏览器本地数据中新增的接管集合 */
+const migrate = (raw: Partial<Database>): Database => ({
+  projects: raw.projects ?? projects,
+  runs: raw.runs ?? runs,
+  baselines: raw.baselines ?? baselines,
+  rules: raw.rules ?? rules,
+  takeovers: raw.takeovers ?? [],
+  batches: raw.batches ?? [],
+})
 
 export const readDb = (): Database => {
   const raw = localStorage.getItem(STORAGE_KEY)
@@ -271,7 +328,13 @@ export const readDb = (): Database => {
     return initial
   }
   try {
-    return JSON.parse(raw) as Database
+    const parsed = JSON.parse(raw) as Partial<Database>
+    if (!parsed.takeovers || !parsed.batches) {
+      const migrated = migrate(parsed)
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated))
+      return migrated
+    }
+    return parsed as Database
   } catch {
     const initial = seed()
     localStorage.setItem(STORAGE_KEY, JSON.stringify(initial))

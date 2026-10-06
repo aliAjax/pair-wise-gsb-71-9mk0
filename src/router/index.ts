@@ -12,6 +12,7 @@ const router = createRouter({
         { path: 'runs', name: 'runs', component: () => import('@/pages/RunsPage.vue') },
         { path: 'runs/:id', name: 'run-detail', component: () => import('@/pages/RunDetailPage.vue') },
         { path: 'approvals', name: 'approvals', component: () => import('@/pages/ApprovalsPage.vue') },
+        { path: 'takeovers', name: 'takeovers', component: () => import('@/pages/TakeoversPage.vue') },
         { path: 'baselines', name: 'baselines', component: () => import('@/pages/BaselinesPage.vue') },
         { path: 'rules', name: 'rules', component: () => import('@/pages/RulesPage.vue') },
         { path: 'reports', name: 'reports', component: () => import('@/pages/ReportsPage.vue') },

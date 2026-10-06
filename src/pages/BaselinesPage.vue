@@ -11,6 +11,12 @@ const { data: baselines, isLoading } = useQuery({
 })
 
 const projectName = (id: string) => projects.value?.find((project) => project.id === id)?.name ?? id
+
+const verdictLabel: Record<string, string> = {
+  'design-change': '设计变更',
+  'render-error': '渲染异常',
+  'environment-noise': '环境噪声',
+}
 </script>
 
 <template>
@@ -38,6 +44,35 @@ const projectName = (id: string) => projects.value?.find((project) => project.id
           </a-table-column>
           <a-table-column title="基线版本" :width="180">
             <template #cell="{ record }"><code>{{ record.version }}</code></template>
+          </a-table-column>
+          <a-table-column title="批准当时快照" :width="320">
+            <template #cell="{ record }">
+              <div v-if="record.snapshot" class="snapshot-cell">
+                <div class="snapshot-line">
+                  基准版本 <code>{{ record.snapshot.baselineVersion }}</code>
+                </div>
+                <template v-if="record.snapshot.screenshotSummary">
+                  <div class="snapshot-line">
+                    摘要 {{ record.snapshot.screenshotSummary.digest }} · 区域
+                    {{ record.snapshot.screenshotSummary.regionCount }} · 规则指纹
+                    {{ record.snapshot.ruleFingerprint.slice(0, 8) }}
+                  </div>
+                  <a-space wrap :size="4">
+                    <a-tag
+                      v-for="conclusion in record.snapshot.regionConclusions"
+                      :key="conclusion.regionId"
+                      size="small"
+                      :color="conclusion.ignored ? 'gray' : conclusion.verdict === 'render-error' ? 'red' : 'arcoblue'"
+                    >
+                      {{ conclusion.regionId.replace(/^.*-r(\d+)$/, 'R$1') }}：
+                      {{ conclusion.ignored ? '已忽略' : verdictLabel[conclusion.verdict] }}
+                    </a-tag>
+                  </a-space>
+                </template>
+                <a-tag v-else color="purpledot" size="small">旧包缺摘要 · 待核</a-tag>
+              </div>
+              <span v-else class="muted">接管机制上线前的历史基线，无快照</span>
+            </template>
           </a-table-column>
           <a-table-column title="设备 / 主题" :width="170">
             <template #cell="{ record }">{{ record.device }} · {{ record.theme === 'light' ? '浅色' : '深色' }}</template>

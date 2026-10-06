@@ -7,7 +7,7 @@ import DiffCanvas from '@/components/DiffCanvas.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { getRun, reviewRun } from '@/api/http'
 import { useReviewStore } from '@/stores/review'
-import type { DifferenceRegion, ReviewCategory } from '@/types'
+import type { DifferenceRegion, ReviewCategory, TakeoverOrder } from '@/types'
 
 interface ReviewForm {
   category: ReviewCategory
@@ -57,13 +57,46 @@ const suspiciousPixels = computed(() =>
     .reduce((total, region) => total + region.pixels, 0),
 )
 
+const takeoverNotice = (takeover: TakeoverOrder): { message: string; stay: boolean } => {
+  if (takeover.status === 'draft-conflict') {
+    return {
+      message: `另一窗口已先批准同页目标（先到包 ${takeover.conflictWith}），本次审批留草稿并列冲突，未重复生成基线`,
+      stay: true,
+    }
+  }
+  if (takeover.status === 'stale') {
+    return {
+      message: `规则或截图摘要已变化，接管失效需重算：${takeover.staleReasons.join('；')}`,
+      stay: true,
+    }
+  }
+  if (takeover.status === 'pending-verification') {
+    return {
+      message: '审批包缺少截图摘要，已进入待核；补传摘要并确认后才会启用基线',
+      stay: true,
+    }
+  }
+  if (takeover.decision === 'rejected') {
+    return { message: '已驳回归并保留原基线，接管单记录逐区结论', stay: false }
+  }
+  return { message: '审批通过，新基线已按当时快照留痕', stay: false }
+}
+
 const reviewMutation = useMutation({
   mutationFn: (payload: ReviewForm) => reviewRun(runId.value, payload),
-  onSuccess: async (updated) => {
-    Message.success(updated.review?.decision === 'approved' ? '审批通过，新基线已留痕' : '已驳回归并保留原基线')
+  onSuccess: async ({ takeover }) => {
+    const notice = takeoverNotice(takeover)
+    if (notice.stay) {
+      Message.warning(notice.message)
+      await queryClient.invalidateQueries({ queryKey: ['run', runId.value] })
+      await queryClient.invalidateQueries({ queryKey: ['takeovers'] })
+      return
+    }
+    Message.success(notice.message)
     await queryClient.invalidateQueries({ queryKey: ['run', runId.value] })
     await queryClient.invalidateQueries({ queryKey: ['runs'] })
     await queryClient.invalidateQueries({ queryKey: ['baselines'] })
+    await queryClient.invalidateQueries({ queryKey: ['takeovers'] })
     await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
     await router.push('/approvals')
   },

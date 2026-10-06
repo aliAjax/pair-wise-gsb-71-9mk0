@@ -834,3 +834,39 @@ code {
     height: 590px;
   }
 }
+
+/* 续作接管 */
+.summary-cell,
+.snapshot-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.summary-cell code,
+.snapshot-line code {
+  font-size: 11px;
+}
+
+.summary-cell span,
+.snapshot-line {
+  color: #4e5969;
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.conflict-reason,
+.stale-reason {
+  margin-top: 4px;
+  color: #f53f3f;
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.conflict-reason {
+  color: #ff7d00;
+}
+
+.muted {
+  color: #86909c;
+}
