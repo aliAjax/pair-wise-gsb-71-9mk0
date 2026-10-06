@@ -1,4 +1,13 @@
-import type { Baseline, DifferenceRegion, IgnoreRule, Project, ScreenshotRun } from '@/types'
+import type {
+  ApprovalPackage,
+  Baseline,
+  DifferenceRegion,
+  IgnoreRule,
+  Project,
+  ScreenshotRun,
+  Takeover,
+  WriteBatch,
+} from '@/types'
 
 const STORAGE_KEY = 'visual-regression-platform-v1'
 
@@ -7,6 +16,9 @@ interface Database {
   runs: ScreenshotRun[]
   baselines: Baseline[]
   rules: IgnoreRule[]
+  takeovers: Takeover[]
+  packages: ApprovalPackage[]
+  batches: WriteBatch[]
 }
 
 const projects: Project[] = [
@@ -261,7 +273,64 @@ const rules: IgnoreRule[] = [
   },
 ]
 
-const seed = (): Database => ({ projects, runs, baselines, rules })
+// 旧窗口回传的审批包：缺少截图摘要，回传后先挂“待核”，补齐摘要前不启用
+const legacyPackages: ApprovalPackage[] = [
+  {
+    id: 'pkg-legacy-961',
+    takeoverId: 'takeover-legacy-961',
+    runId: 'run-1046',
+    clientId: 'client-legacy-window',
+    targetKey: 'p-console|账单明细|Desktop 1920|dark',
+    baselineVersion: 'v5.9.1-baseline',
+    currentVersion: 'billing-v3.7',
+    review: {
+      category: 'design-change',
+      decision: 'approved',
+      reviewer: '周航',
+      reason: '离线窗口回传的旧审批包，缺少截图摘要，待核后再决定是否启用。',
+    },
+    digest: null,
+    regionVerdicts: [],
+    status: 'needs-verification',
+    conflictWith: [],
+    submittedAt: '2026-09-28T18:05:00+08:00',
+  },
+]
+
+const seed = (): Database => ({
+  projects,
+  runs,
+  baselines,
+  rules,
+  takeovers: [],
+  packages: legacyPackages,
+  batches: [],
+})
+
+/** 旧版本存档补齐续作接管所需集合，并给历史有效基线补一个占位快照 */
+const migrate = (raw: Partial<Database>): Database => {
+  const base = seed()
+  const db: Database = {
+    projects: raw.projects ?? base.projects,
+    runs: raw.runs ?? base.runs,
+    baselines: raw.baselines ?? base.baselines,
+    rules: raw.rules ?? base.rules,
+    takeovers: raw.takeovers ?? [],
+    packages: raw.packages ?? base.packages,
+    batches: raw.batches ?? [],
+  }
+  db.baselines.forEach((baseline) => {
+    if (!baseline.snapshot) {
+      baseline.snapshot = {
+        digestHash: 'legacy-unknown',
+        rulesHash: 'legacy-unknown',
+        verdictCount: 0,
+        frozenAt: baseline.approvedAt,
+      }
+    }
+  })
+  return db
+}
 
 export const readDb = (): Database => {
   const raw = localStorage.getItem(STORAGE_KEY)
@@ -271,7 +340,7 @@ export const readDb = (): Database => {
     return initial
   }
   try {
-    return JSON.parse(raw) as Database
+    return migrate(JSON.parse(raw) as Partial<Database>)
   } catch {
     const initial = seed()
     localStorage.setItem(STORAGE_KEY, JSON.stringify(initial))

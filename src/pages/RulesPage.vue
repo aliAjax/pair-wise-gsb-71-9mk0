@@ -20,7 +20,12 @@ const form = reactive({
 const { data: rules, isLoading } = useQuery({ queryKey: ['rules'], queryFn: getRules })
 const { data: projects } = useQuery({ queryKey: ['projects'], queryFn: getProjects })
 
-const refreshRules = async () => queryClient.invalidateQueries({ queryKey: ['rules'] })
+const refreshRules = async () => {
+  // 规则一变，未确认接管会被后端标记失效；同步刷新接管/运行缓存
+  await queryClient.invalidateQueries({ queryKey: ['rules'] })
+  await queryClient.invalidateQueries({ queryKey: ['takeover'] })
+  await queryClient.invalidateQueries({ queryKey: ['takeovers'] })
+}
 
 const createMutation = useMutation({
   mutationFn: createRule,

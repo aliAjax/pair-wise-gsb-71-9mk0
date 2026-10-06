@@ -1,10 +1,20 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { Message } from '@arco-design/web-vue'
-import { getRuns, mergeRuns } from '@/api/http'
+import {
+  getBaselineConflicts,
+  getBaselines,
+  getBatches,
+  getPackages,
+  getRuns,
+  mergeRuns,
+  recoverBatches,
+  resolveConflictPackage,
+  verifyLegacyPackage,
+} from '@/api/http'
 import StatusTag from '@/components/StatusTag.vue'
-import type { ScreenshotRun } from '@/types'
+import type { ApprovalPackage } from '@/types'
 
 const queryClient = useQueryClient()
 const selectedKeys = ref<string[]>([])
@@ -13,6 +23,26 @@ const { data: runs, isLoading } = useQuery({
   queryKey: ['runs', { status: 'pending' }],
   queryFn: () => getRuns({ status: 'pending' }),
 })
+
+const { data: packages } = useQuery({
+  queryKey: ['packages', 'approval-queue'],
+  queryFn: () => getPackages(),
+})
+
+const { data: conflicts } = useQuery({
+  queryKey: ['baseline-conflicts'],
+  queryFn: getBaselineConflicts,
+})
+
+const { data: batches } = useQuery({ queryKey: ['batches'], queryFn: getBatches })
+
+const refreshAll = async () => {
+  await queryClient.invalidateQueries({ queryKey: ['packages'] })
+  await queryClient.invalidateQueries({ queryKey: ['baseline-conflicts'] })
+  await queryClient.invalidateQueries({ queryKey: ['batches'] })
+  await queryClient.invalidateQueries({ queryKey: ['baselines'] })
+  await queryClient.invalidateQueries({ queryKey: ['runs'] })
+}
 
 const mergeMutation = useMutation({
   mutationFn: mergeRuns,
@@ -24,25 +54,161 @@ const mergeMutation = useMutation({
   onError: (error: Error) => Message.error(error.message),
 })
 
-const unignoredCount = (run: ScreenshotRun) =>
+const verifyMutation = useMutation({
+  mutationFn: verifyLegacyPackage,
+  onSuccess: async (pkg) => {
+    Message.success(
+      pkg.conflictWith.length > 0
+        ? '旧包已补齐摘要，转为冲突草稿等待化解'
+        : '旧包已补齐摘要，可重新提交接管',
+    )
+    await refreshAll()
+  },
+  onError: (error: Error) => Message.error(error.message),
+})
+
+const resolveMutation = useMutation({
+  mutationFn: ({
+    packageId,
+    payload,
+  }: {
+    packageId: string
+    payload: { mode: 'keep-existing' | 'activate-package'; keepBaselineId?: string }
+  }) => resolveConflictPackage(packageId, payload),
+  onSuccess: async (pkg) => {
+    Message.success(pkg.status === 'active' ? '冲突已化解，该审批包基线启用' : '冲突已化解，该审批包标记为被取代')
+    await refreshAll()
+  },
+  onError: (error: Error) => Message.error(error.message),
+})
+
+const recoverMutation = useMutation({
+  mutationFn: recoverBatches,
+  onSuccess: async (result) => {
+    if (result.recovered === 0) Message.info('没有待恢复的批次')
+    else Message.success(`已恢复 ${result.recovered} 个批次，重放跳过重复基线，未重复生成`)
+    await refreshAll()
+  },
+  onError: (error: Error) => Message.error(error.message),
+})
+
+const unignoredCount = (run: { regions: Array<{ ignored: boolean }> }) =>
   run.regions.filter((region) => !region.ignored).length
+
+const pendingVerify = computed(
+  () => packages.value?.filter((pkg) => pkg.status === 'needs-verification') ?? [],
+)
+const draftConflicts = computed(
+  () => packages.value?.filter((pkg) => pkg.status === 'draft-conflict') ?? [],
+)
+const pendingBatches = computed(() => batches.value?.filter((batch) => batch.status === 'prepared') ?? [])
+
+const baselinesForConflict = (pkg: ApprovalPackage) => {
+  const duplicated = conflicts.value?.duplicates.find((item) => item.targetKey === pkg.targetKey)
+  if (duplicated) return duplicated.baselines
+  // newer-baseline：冲突对方是当前唯一有效基线，候选由 packages 接口附带的冲突 id 给出
+  return allBaselines.value?.filter((baseline) => pkg.conflictWith.includes(baseline.id)) ?? []
+}
+
+const { data: allBaselines } = useQuery({
+  queryKey: ['baselines', 'conflict-resolution'],
+  queryFn: () => getBaselines(),
+})
+
+const shortTarget = (targetKey: string) => targetKey.split('|').slice(1, 3).join(' · ')
 </script>
 
 <template>
   <section class="page-intro compact">
     <div>
       <h2>待审批队列</h2>
-      <p>审批人不能直接覆盖基线；批准、驳回和忽略都必须留下可审计原因。</p>
+      <p>两窗口同时批准同一目标时，先到者启用、后到者留冲突草稿；旧包缺摘要先待核。</p>
     </div>
     <a-space>
+      <a-button
+        v-if="pendingBatches.length > 0"
+        status="warning"
+        :loading="recoverMutation.isPending.value"
+        @click="recoverMutation.mutate()"
+      >
+        <icon-history /> 恢复中断批次（{{ pendingBatches.length }}）
+      </a-button>
       <a-button :disabled="selectedKeys.length < 2" @click="mergeMutation.mutate(selectedKeys)">
         <icon-merge /> 合并重复运行
       </a-button>
-      <a-button type="primary" :disabled="selectedKeys.length === 0" @click="selectedKeys = []">
-        清除选择
-      </a-button>
     </a-space>
   </section>
+
+  <a-alert
+    v-for="batch in pendingBatches"
+    :key="batch.id"
+    type="warning"
+    closable
+    style="margin-bottom: 10px"
+  >
+    批次 {{ batch.id }} 在写入后中断，审批包与基线操作已完整保留，重放不会重复生成基线。
+  </a-alert>
+
+  <div v-if="pendingVerify.length > 0" class="handoff-section">
+    <div class="handoff-heading">
+      <h3><icon-exclamation-circle-fill class="tone-warning" /> 旧审批包待核（{{ pendingVerify.length }}）</h3>
+      <span>回传时缺少截图摘要，补齐前不允许启用</span>
+    </div>
+    <a-card v-for="pkg in pendingVerify" :key="pkg.id" class="handoff-card" :bordered="false">
+      <div class="handoff-main">
+        <strong>{{ shortTarget(pkg.targetKey) }}</strong>
+        <span>运行 {{ pkg.runId }} · 版本 {{ pkg.currentVersion }} · {{ pkg.review?.reviewer }}</span>
+        <p>{{ pkg.review?.reason }}</p>
+      </div>
+      <a-button type="primary" size="small" :loading="verifyMutation.isPending.value" @click="verifyMutation.mutate(pkg.id)">
+        补齐截图摘要并核
+      </a-button>
+    </a-card>
+  </div>
+
+  <div v-if="draftConflicts.length > 0" class="handoff-section">
+    <div class="handoff-heading">
+      <h3><icon-swap class="tone-danger" /> 冲突草稿（{{ draftConflicts.length }}）</h3>
+      <span>另一窗口已先批准同一目标，需人工选择保留哪条基线</span>
+    </div>
+    <a-card v-for="pkg in draftConflicts" :key="pkg.id" class="handoff-card" :bordered="false">
+      <div class="handoff-main">
+        <strong>{{ shortTarget(pkg.targetKey) }} · {{ pkg.currentVersion }}</strong>
+        <span>
+          运行 {{ pkg.runId }} ·
+          {{ pkg.conflictReason === 'duplicate-active' ? '同页已有两条有效基线' : '基准版本已被新窗口推进' }}
+        </span>
+        <div class="conflict-baselines">
+          <button
+            v-for="baseline in baselinesForConflict(pkg)"
+            :key="baseline.id"
+            class="conflict-choice"
+            :class="{ winner: baseline.runId === pkg.runId }"
+            @click="
+              resolveMutation.mutate({
+                packageId: pkg.id,
+                payload: { mode: 'keep-existing', keepBaselineId: baseline.id },
+              })
+            "
+          >
+            <code>{{ baseline.version }}</code>
+            <span>{{ baseline.approvedBy }} · {{ baseline.approvedAt.slice(0, 10) }}</span>
+            <b>{{ baseline.runId === pkg.runId ? '保留本包基线' : '保留对方基线' }}</b>
+          </button>
+          <button
+            class="conflict-choice activate-self"
+            @click="
+              resolveMutation.mutate({ packageId: pkg.id, payload: { mode: 'activate-package' } })
+            "
+          >
+            <code>{{ pkg.currentVersion }}</code>
+            <span>按本审批包摘要补建并启用</span>
+            <b>强制启用本包</b>
+          </button>
+        </div>
+      </div>
+    </a-card>
+  </div>
 
   <div class="queue-summary">
     <div>
@@ -54,12 +220,12 @@ const unignoredCount = (run: ScreenshotRun) =>
       <strong class="danger">{{ runs?.filter((run) => run.mismatchRate >= 5).length ?? 0 }}</strong>
     </div>
     <div>
-      <span>可合并运行</span>
-      <strong>2 组</strong>
+      <span>冲突草稿</span>
+      <strong class="danger">{{ draftConflicts.length }}</strong>
     </div>
     <div>
-      <span>预计阻塞时间</span>
-      <strong>43 分钟</strong>
+      <span>旧包待核</span>
+      <strong class="tone-warning">{{ pendingVerify.length }}</strong>
     </div>
   </div>
 
